@@ -1,0 +1,1 @@
+console.log('Polite scraper initialized (Stage 0)');
