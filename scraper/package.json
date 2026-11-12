@@ -1,0 +1,13 @@
+{
+  "name": "scraper",
+  "version": "1.0.0",
+  "description": "A polite Node.js web scraping pipeline (`fetch` + `Cheerio` + `Zod`) built for FlyRank Backend Track Assignment `BE-05` (`W5 · A9`).",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
