@@ -7,7 +7,7 @@ const MAX_CATALOGUE_PAGES = 3;
 const REQUEST_DELAY_MS = 600;
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
 const USER_AGENT =
-  'FlyRankInternship-A9/1.0 (+https://github.com/<YOUR_GITHUB_USERNAME>/polite-web-scraper)';
+  'FlyRankInternship-A9/1.0 (+https://github.com/reyjoypsabino/polite-web-scraper)';
 const TIMEOUT_MS = 10000;
 
 let liveFetchCount = 0;
@@ -95,11 +95,71 @@ async function discoverBooks() {
   return uniqueBooks;
 }
 
+function getBookCachePath(productUrl) {
+  const pathname = new URL(productUrl).pathname;
+  const slug = pathname
+    .replace(/^\/catalogue\//, '')
+    .replace(/\/index\.html$/, '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(CACHE_DIR, 'books', `${slug}.html`);
+}
+
+function parseBookDetail(html, bookEntry) {
+  const $ = cheerio.load(html);
+
+  // Scope selectors strictly to the product container
+  const product = $('article.product_page');
+  const mainInfo = product.find('div.product_main');
+
+  const title = mainInfo.find('h1').text().trim();
+  const price_text = mainInfo.find('p.price_color').text().trim();
+  const availability_text = mainInfo
+    .find('p.instock.availability')
+    .text()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const ratingClasses = (mainInfo.find('p.star-rating').attr('class') || '').split(/\s+/);
+  const rating_text = ratingClasses.find((cls) => cls !== 'star-rating') || null;
+
+  const descText = product.find('#product_description').next('p').text().trim();
+  const description = descText.length > 0 ? descText : null;
+
+  return {
+    title,
+    product_url: bookEntry.product_url,
+    price_text,
+    availability_text,
+    rating_text,
+    description,
+    source_page: bookEntry.source_page,
+    fetched_at: new Date().toISOString(),
+  };
+}
+
+async function extractBookDetails(books) {
+  const rawRecords = [];
+
+  for (const book of books) {
+    const cacheFile = getBookCachePath(book.product_url);
+    const { html } = await fetchWithCache(book.product_url, cacheFile);
+    const record = parseBookDetail(html, book);
+    rawRecords.push(record);
+  }
+
+  return rawRecords;
+}
+
 async function main() {
-  await discoverBooks();
+  const books = await discoverBooks();
+  const rawRecords = await extractBookDetails(books);
+
+  console.log('\nSample raw record:');
+  console.log(JSON.stringify(rawRecords[0], null, 2));
+  console.log(`\ndetail_pages=${rawRecords.length}`);
 }
 
 main().catch((err) => {
-  console.error('Stage 2 failed:', err.message);
+  console.error('Stage 3 failed:', err.message);
   process.exit(1);
 });
