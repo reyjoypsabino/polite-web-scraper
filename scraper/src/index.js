@@ -6,17 +6,30 @@ const { z } = require('zod');
 const START_URL = 'https://books.toscrape.com/catalogue/page-1.html';
 const MAX_CATALOGUE_PAGES = 3;
 const REQUEST_DELAY_MS = 600;
+const RETRY_DELAY_MS = 1000;
+const TIMEOUT_MS = 10000;
+
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const BOOKS_OUTPUT_PATH = path.join(OUTPUT_DIR, 'books.json');
 const ERRORS_OUTPUT_PATH = path.join(OUTPUT_DIR, 'errors.json');
+const REPORT_OUTPUT_PATH = path.join(OUTPUT_DIR, 'run-report.json');
+
 const USER_AGENT =
   'FlyRankInternship-A9/1.0 (+https://github.com/reyjoypsabino/polite-web-scraper)';
-const TIMEOUT_MS = 10000;
 
-let liveFetchCount = 0;
+const SIMULATE_FAILURE = process.argv.includes('--test-failure');
+const FAKE_TEST_BOOK = {
+  product_url: 'https://books.toscrape.com/catalogue/non-existent-book-checkpoint-404/index.html',
+  source_page: START_URL,
+};
 
-// Schema defining a valid, normalized book record
+const runMetrics = {
+  liveRequestCount: 0,
+  pagesFetched: 0,
+  cacheHits: 0,
+};
+
 const BookRecordSchema = z.object({
   title: z.string().min(1, 'Title is required'),
   product_url: z.string().url().startsWith('https://'),
@@ -36,33 +49,63 @@ function sleep(ms) {
 async function fetchWithCache(url, cacheFilePath) {
   try {
     const cachedHtml = await fs.readFile(cacheFilePath, 'utf8');
+    runMetrics.cacheHits += 1;
     console.log(`CACHE HIT | ${url} | size=${Buffer.byteLength(cachedHtml, 'utf8')} bytes`);
     return { html: cachedHtml, fromCache: true };
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
 
-  if (liveFetchCount > 0) {
-    await sleep(REQUEST_DELAY_MS);
+  const maxAttempts = 2; // Initial request + at most 1 retry for timeouts or 5xx
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (runMetrics.liveRequestCount > 0) {
+      await sleep(REQUEST_DELAY_MS);
+    }
+    runMetrics.liveRequestCount += 1;
+
+    try {
+      const response = await fetch(url, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+
+      if (response.status === 200) {
+        const html = await response.text();
+        runMetrics.pagesFetched += 1;
+
+        await fs.mkdir(path.dirname(cacheFilePath), { recursive: true });
+        await fs.writeFile(cacheFilePath, html, 'utf8');
+
+        console.log(
+          `FETCH     | ${url} | status=${response.status} | size=${Buffer.byteLength(html, 'utf8')} bytes`
+        );
+        return { html, fromCache: false };
+      }
+
+      // Never retry 404 (missing page) or 403 (forbidden)
+      if (response.status === 404 || response.status === 403) {
+        const noRetryErr = new Error(`HTTP ${response.status} (${response.statusText || 'Not Retryable'})`);
+        noRetryErr.noRetry = true;
+        throw noRetryErr;
+      }
+
+      // Retryable 5xx server error
+      if (response.status >= 500 && response.status < 600) {
+        throw new Error(`HTTP ${response.status} server error`);
+      }
+
+      const otherErr = new Error(`Unexpected HTTP ${response.status}`);
+      otherErr.noRetry = true;
+      throw otherErr;
+    } catch (err) {
+      if (err.noRetry || attempt === maxAttempts) {
+        throw err;
+      }
+      console.warn(`RETRY     | ${url} | attempt=${attempt + 1} | reason=${err.message}`);
+      await sleep(RETRY_DELAY_MS);
+    }
   }
-
-  const response = await fetch(url, {
-    headers: { 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-
-  if (response.status !== 200) {
-    throw new Error(`Unexpected HTTP status ${response.status} for ${url}`);
-  }
-
-  const html = await response.text();
-  liveFetchCount += 1;
-
-  await fs.mkdir(path.dirname(cacheFilePath), { recursive: true });
-  await fs.writeFile(cacheFilePath, html, 'utf8');
-
-  console.log(`FETCH     | ${url} | status=${response.status} | size=${Buffer.byteLength(html, 'utf8')} bytes`);
-  return { html, fromCache: false };
 }
 
 async function discoverBooks() {
@@ -179,7 +222,6 @@ function normalizeAndValidate(rawRecords) {
       continue;
     }
 
-    // Deduplicate by canonical product_url for idempotent storage
     validByCanonicalUrl.set(result.data.product_url, result.data);
   }
 
@@ -191,30 +233,62 @@ function normalizeAndValidate(rawRecords) {
 
 async function extractBookDetails(books) {
   const rawRecords = [];
+  const failedPages = [];
 
   for (const book of books) {
-    const cacheFile = getBookCachePath(book.product_url);
-    const { html } = await fetchWithCache(book.product_url, cacheFile);
-    const record = parseBookDetail(html, book);
-    rawRecords.push(record);
+    try {
+      const cacheFile = getBookCachePath(book.product_url);
+      const { html } = await fetchWithCache(book.product_url, cacheFile);
+      const record = parseBookDetail(html, book);
+      rawRecords.push(record);
+    } catch (err) {
+      console.error(`FAILED    | ${book.product_url} | reason=${err.message}`);
+      failedPages.push({
+        url: book.product_url,
+        reason: err.message,
+      });
+    }
   }
 
-  return rawRecords;
+  return { rawRecords, failedPages };
 }
 
 async function main() {
+  const startMs = Date.now();
+  const startedAt = new Date(startMs).toISOString();
+
   const books = await discoverBooks();
-  const rawRecords = await extractBookDetails(books);
+  if (SIMULATE_FAILURE) {
+    console.log(`TEST MODE | Injecting fake URL: ${FAKE_TEST_BOOK.product_url}`);
+    books.push(FAKE_TEST_BOOK);
+  }
+
+  const { rawRecords, failedPages } = await extractBookDetails(books);
   const { validRecords, errors } = normalizeAndValidate(rawRecords);
+
+  const finishedMs = Date.now();
+  const runReport = {
+    started_at: startedAt,
+    finished_at: new Date(finishedMs).toISOString(),
+    duration_ms: finishedMs - startMs,
+    pages_fetched: runMetrics.pagesFetched,
+    cache_hits: runMetrics.cacheHits,
+    valid_records: validRecords.length,
+    invalid_records: errors.length,
+    failed_pages: failedPages.length,
+    failures: failedPages,
+  };
 
   await fs.mkdir(OUTPUT_DIR, { recursive: true });
   await fs.writeFile(BOOKS_OUTPUT_PATH, JSON.stringify(validRecords, null, 2), 'utf8');
   await fs.writeFile(ERRORS_OUTPUT_PATH, JSON.stringify(errors, null, 2), 'utf8');
+  await fs.writeFile(REPORT_OUTPUT_PATH, JSON.stringify(runReport, null, 2), 'utf8');
 
-  console.log(`valid_records=${validRecords.length}, invalid_records=${errors.length}`);
+  console.log('\nRun Report:');
+  console.log(JSON.stringify(runReport, null, 2));
 }
 
 main().catch((err) => {
-  console.error('Stage 4 failed:', err.message);
+  console.error('Scraper run failed:', err.message);
   process.exit(1);
 });
