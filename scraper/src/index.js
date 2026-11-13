@@ -1,16 +1,33 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const cheerio = require('cheerio');
+const { z } = require('zod');
 
 const START_URL = 'https://books.toscrape.com/catalogue/page-1.html';
 const MAX_CATALOGUE_PAGES = 3;
 const REQUEST_DELAY_MS = 600;
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
+const OUTPUT_DIR = path.join(__dirname, '..', 'output');
+const BOOKS_OUTPUT_PATH = path.join(OUTPUT_DIR, 'books.json');
+const ERRORS_OUTPUT_PATH = path.join(OUTPUT_DIR, 'errors.json');
 const USER_AGENT =
   'FlyRankInternship-A9/1.0 (+https://github.com/reyjoypsabino/polite-web-scraper)';
 const TIMEOUT_MS = 10000;
 
 let liveFetchCount = 0;
+
+// Schema defining a valid, normalized book record
+const BookRecordSchema = z.object({
+  title: z.string().min(1, 'Title is required'),
+  product_url: z.string().url().startsWith('https://'),
+  price_text: z.string().min(1, 'Raw price text is required'),
+  price_gbp: z.number().nonnegative().finite(),
+  availability_text: z.string().min(1, 'Availability text is required'),
+  rating_text: z.string().min(1, 'Rating text is required'),
+  description: z.string().min(1).nullable(),
+  source_page: z.string().url().startsWith('https://'),
+  fetched_at: z.string().datetime(),
+});
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -25,7 +42,6 @@ async function fetchWithCache(url, cacheFilePath) {
     if (err.code !== 'ENOENT') throw err;
   }
 
-  // Wait >= 0.5s between real network requests (never for cached reads)
   if (liveFetchCount > 0) {
     await sleep(REQUEST_DELAY_MS);
   }
@@ -107,7 +123,6 @@ function getBookCachePath(productUrl) {
 function parseBookDetail(html, bookEntry) {
   const $ = cheerio.load(html);
 
-  // Scope selectors strictly to the product container
   const product = $('article.product_page');
   const mainInfo = product.find('div.product_main');
 
@@ -120,7 +135,7 @@ function parseBookDetail(html, bookEntry) {
     .trim();
 
   const ratingClasses = (mainInfo.find('p.star-rating').attr('class') || '').split(/\s+/);
-  const rating_text = ratingClasses.find((cls) => cls !== 'star-rating') || null;
+  const rating_text = ratingClasses.find((cls) => cls !== 'star-rating') || '';
 
   const descText = product.find('#product_description').next('p').text().trim();
   const description = descText.length > 0 ? descText : null;
@@ -134,6 +149,43 @@ function parseBookDetail(html, bookEntry) {
     description,
     source_page: bookEntry.source_page,
     fetched_at: new Date().toISOString(),
+  };
+}
+
+function parsePriceGbp(priceText) {
+  const cleaned = priceText.replace(/[^0-9.]/g, '');
+  if (!cleaned) return Number.NaN;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? Number(parsed.toFixed(2)) : Number.NaN;
+}
+
+function normalizeAndValidate(rawRecords) {
+  const validByCanonicalUrl = new Map();
+  const errors = [];
+
+  for (const raw of rawRecords) {
+    const candidate = {
+      ...raw,
+      price_gbp: parsePriceGbp(raw.price_text),
+    };
+
+    const result = BookRecordSchema.safeParse(candidate);
+    if (!result.success) {
+      errors.push({
+        product_url: raw.product_url,
+        reason: result.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`),
+        raw_record: raw,
+      });
+      continue;
+    }
+
+    // Deduplicate by canonical product_url for idempotent storage
+    validByCanonicalUrl.set(result.data.product_url, result.data);
+  }
+
+  return {
+    validRecords: Array.from(validByCanonicalUrl.values()),
+    errors,
   };
 }
 
@@ -153,13 +205,16 @@ async function extractBookDetails(books) {
 async function main() {
   const books = await discoverBooks();
   const rawRecords = await extractBookDetails(books);
+  const { validRecords, errors } = normalizeAndValidate(rawRecords);
 
-  console.log('\nSample raw record:');
-  console.log(JSON.stringify(rawRecords[0], null, 2));
-  console.log(`\ndetail_pages=${rawRecords.length}`);
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+  await fs.writeFile(BOOKS_OUTPUT_PATH, JSON.stringify(validRecords, null, 2), 'utf8');
+  await fs.writeFile(ERRORS_OUTPUT_PATH, JSON.stringify(errors, null, 2), 'utf8');
+
+  console.log(`valid_records=${validRecords.length}, invalid_records=${errors.length}`);
 }
 
 main().catch((err) => {
-  console.error('Stage 3 failed:', err.message);
+  console.error('Stage 4 failed:', err.message);
   process.exit(1);
 });
